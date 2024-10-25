@@ -1,0 +1,234 @@
+---
+title: "Hackathon 2024"
+author: "Ricardo Illescas Carrancá"
+date: "2024-10-24"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## xGI: expected Goals Incremented
+
+En el futbol existe un gran problema al evaluar jugadores. La mayoría de las métricas están enfocadas en delanteros. Para centrocampistas y defensores, podemos comparar estadísticas puntuales, pero no hay una estadística que evalúe a todas las posiciones por igual. Sabemos que en Statsbomb y otras fuentes de datos generan su propio expected goal para cada tiro. La intención de esta métrica es poder tener una medición del rendimiento de todas las acciones realizadas por un jugador. Claro que conseguir una métrica perfecta es imposible, pero el objetivo es poder medir a todos por igual. 
+
+# Inspiración
+
+La idea de xGI surge de una métrica que se utiliza en el futbol americano, llamada EPA (Expected Points Added). Esta métrica mide para cada jugada los puntos que se esperan de ese drive. Funcionaría muy diferente en el mundo del futbol, pero la idea es tener una métrica similar. Actualmente, tenemos los goles esperados por cada tiro y también se puede realizar el gol esperado dado un tiro a puerta.
+
+# Lo que se tiene actualmente
+
+Ahora es fácil calcular xG y expected Goal Assists, que se mide según pases que hayan sido un tiro después. Tenemos intercepciones, entradas duelos y muchas otras estadísticas que describen acciones defensivas, sin embargo no miden la calidad e importancia de esos momentos.
+
+# Explicación de xGI
+
+Se utiliza el nombre expected Goals Incremented porque expected Goals Added podría tener de siglas xGA que ya se utiliza para la estadística expected Goals Assisted. Lo que buscamos medir es con cada acción cuanto aumenta la probabilidad de gol. Para calcular xG se utiliza una regresión lineal con parámetros de distancia a portería y el ángulo hacia la portería. Idealmente, tendríamos la parte del cuerpo con la que se hace contacto, altura del balón, presión y otras métricas importantes. Por el tipo de datos a utilizar en este trabajo, para la regresión se utilizan los tiros de torneos internacionales públicos en Statsbomb. La fórmula para este cálculo de xG es xG = 0.033877 - 0.0027603*dist + 0.0055795*ang y en caso de ser menor a 0, el xG es 0.
+Para este análisis, únicamente se toman en cuenta siete diferentes eventos. A continuación se presenta cómo se calcula el xGI para cada uno de ellos.
+* Recuperación de balón: calculamos cuál es el xG del rival en esa posición y el xG del que realiza la recuperación, entonces el xGI es una suma de lo que se le quitó de xG al rival y lo que aumento el propio. Cuando es una recuperación fallida, no se aumenta nada al xGI. Con esto nos aseguramos que si el jugador recupera el balón cerca de su porterí
+* Pérdida de posesión: similar al anterior, aproximamos el xG tanto para el oponente como para el jugador a evaluar, en lugar de sumar el xg de oponente y propio, se le resta. Con esto aseguramos que si el jugador pierde el balón en territorio contrario se le reste la probabilidad que llevaba su equipo de anotar.
+* Despeje: en este caso únicamente se calcula el xG del rival y ese valor es lo que se le asigna al xGI porque con el despeje se le quitó al rival ese xG.
+* Intercepción: esta función es igual a la de recuperación de balón, si interceptas con éxito, se toma el xG del rival y se suma al xG propio en la posición de la intercepción. Entonces el valor de xGI equivale a la suma de los xG del rival y del equipo propio.
+* Disparo: en esta función hay un área de oportunidad algo grande. Lo ideal sería tomar el xG del tiro, calcular el xGOT y la resta de xGOT y xG es lo que aumenta o disminuye el tiro para xGI. Al no tener xGOT en los datos. Lo que realizamos es que si el tiró resultó en un gol, xGI es 1-xG del tiro. Si el tiro fue atajado o bloqueado, se le resta la mitad del xG del tiro debido a que pudo ser un buen tiro, entonces no se le resta el xG completo. Si el tiro fue afuera de la portería, entonces si se le resta el xG completo.
+* Autogol: para este caso, el jugador perderá xGI de 1-xG en la posición para el rival. La lógica aquí es que el autogol puede llegar en un momento en el cual era muy probable que el rival anotara, en ese caso se le resta menos que un autogol improbable.
+* Pase: esta función primero analiza cual fue el resultado del pase. Si el pase llevó a un tiro de otro jugador, xGI será la resta entre el xG del tiro y el xG en la posición del pase. Si el pase fue incompleto, xGI es el xG en la posición inicial del pase de forma negativa ya que pierde esa probabilidad de go. Por último, si el pase es completo pero no fue un tiro, únicamente se calcula el xG del punto de partida del pase y el punto de llegada y xGI es la resta del xG final menos el xG inicial.
+
+## Ejemplo en R
+Vamos a tomar la información de Statsbomb de la Euro 2024 y la Copa América 2024, para después procesarla y analizar los jugadores con mejores xGI en estas competiciones. 
+Primero importamos las librerías necesarias y el archivo donde vienen las funciones para calcular xGI.
+```{r}
+library(tidyverse)
+library(StatsBombR)
+library(ggplot2)
+source("C:\\Users\\rille\\OneDrive\\Documentos\\Hackathon2024\\StatsBombProject\\funciones_xGI.R")
+```
+En esta sección filtramos los datos para obtener todos los datos de StatsBomb de la Copa América y Euro de 2024.
+```{r}
+#ID Season 2024 = 282
+#ID Euro = 55
+#ID Copa America = 223
+euro <- FreeCompetitions() %>%
+  filter(competition_id==55 & season_id==282)
+copa_america <- FreeCompetitions() %>%
+  filter(competition_id==223 & season_id==282)
+partidos_euro <- FreeMatches(euro)
+partidos_america <- FreeMatches(copa_america)
+sbData_euro <- free_allevents(MatchesDF = partidos_euro)
+sbData_america <- free_allevents(MatchesDF = partidos_america)
+sbData_euro = allclean(sbData_euro) #Esto limpia los datos
+sbData_america = allclean(sbData_america)
+```
+Ya que tenemos todos los eventos de la Euro y Copa América 2024 vamos a filtrarlos para utilizar únicamente los eventos en los cuales tenemos la fórmula para xGI. Con otro código se realizó un filtro para encontrar los centrocampistas con más de 30 minutos jugados en estos torneos. Hacemos este filtro para que no sea tan pesado realizar los cálculos de xGI y comparar jugadores de posiciones similares.
+```{r}
+# Filtramos el tipo de eventos que podemos procesar en las funciones de xGI
+tipos_soportados <- c(2,3,9,10,16,20,30)
+sbData_euro_calculos <- sbData_euro %>%
+  filter(type.id %in% tipos_soportados)
+sbData_america_calculos <- sbData_america %>%
+  filter(type.id %in% tipos_soportados)
+
+#Leemos los datos de los jugadores
+jugadores_america <- read.csv("C:\\Users\\rille\\OneDrive\\Documentos\\Hackathon2024\\StatsBombProject\\players_copaAmerica_wLeague.csv")
+jugadores_euro <- read.csv("C:\\Users\\rille\\OneDrive\\Documentos\\Hackathon2024\\StatsBombProject\\players_euro_wLeague.csv")
+
+# Filtramos a que solo salgan los jugadores de los csvs ya procesados
+sbData_euro_calculos <- sbData_euro_calculos %>%
+  filter(player.id %in% jugadores_euro$player.id)
+sbData_america_calculos <- sbData_america_calculos %>%
+  filter(player.id %in% jugadores_america$player.id)
+
+# Crear una nueva columna para almacenar los resultados
+sbData_euro_calculos$xGI <- NA
+sbData_america_calculos$xGI <- NA
+
+# Iteramos para calcular el xGI de cada evento.
+for (i in 1:nrow(sbData_euro_calculos)) {
+  jugada_euro_id <- sbData_euro_calculos$id[i]
+  sbData_euro_calculos$xGI[i] <- define_funcion(sbData_euro, jugada_euro_id)
+  if (i <= nrow(sbData_america_calculos)){
+    jugada_ame_id <- sbData_america_calculos$id[i]
+    sbData_america_calculos$xGI[i] <- define_funcion(sbData_america, jugada_ame_id)
+  }
+}
+```
+Vamos a agrupar la información por jugador en cada torneo para después graficar quienes fueron los que mejor y peor rendimiento tuvieron basado en esta estadística. Después graficamos los mejores 15 jugadores en cada uno de los torneos y en ambos torneos. 
+```{r}
+agrupados_euro <- sbData_euro_calculos %>%
+  group_by(player.id, player.name) %>%
+  summarise(tot_xGI = sum(xGI))
+agrupados_america <- sbData_america_calculos %>%
+  group_by(player.id, player.name) %>%
+  summarise(tot_xGI = sum(xGI))
+
+euro_mins_totxGI <- agrupados_euro %>%
+  inner_join(jugadores_euro, by = c("player.id", "player.name")) %>%
+  select(player.id, player.name, minutes, League, Top.League, tot_xGI) %>%
+  mutate(nineties = round(minutes/90,2))
+euro_final <- euro_mins_totxGI %>%
+  mutate(xGIper90 = as.numeric(round(tot_xGI / nineties, 4)))
+
+america_mins_totxGI <- agrupados_america %>%
+  inner_join(jugadores_america, by = c("player.id", "player.name")) %>%
+  select(player.id, player.name, minutes, League, Top.League, tot_xGI) %>%
+  mutate(nineties = round(minutes/90,2))
+america_final <- america_mins_totxGI %>%
+  mutate(xGIper90 = as.numeric(round(tot_xGI / nineties, 4)))
+
+#Graficamos los 15 mejores jugadores por cada uno de los torneos respecto a xGI por 90 minutos.
+top_15_euro <- euro_final %>%
+  arrange(desc(xGIper90)) %>%
+  head(15)
+ggplot(top_15_euro, aes(x = reorder(player.name, xGIper90), y = xGIper90)) +
+  geom_bar(stat = "identity", fill = "darkblue") +
+  coord_flip() +  # Voltea las barras para una mejor legibilidad
+  labs(title = "Jugadores con mayor xGI por 90 minutos - Euro 2024",
+       x = "Jugador",
+       y = "xGI por 90 minutos") +
+  theme_minimal()
+bottom_15_euro <- euro_final %>%
+  arrange(xGIper90) %>%
+  head(15)
+ggplot(bottom_15_euro, aes(x = reorder(player.name, xGIper90), y = xGIper90)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  coord_flip() +  # Voltea las barras para una mejor legibilidad
+  labs(title = "Jugadores con menor xGI por 90 minutos - Euro 2024",
+       x = "Jugador",
+       y = "xGI por 90 minutos") +
+  theme_minimal()
+
+#Repetimos para Copa América
+top_15_america <- america_final %>%
+  arrange(desc(xGIper90)) %>%
+  head(15)
+ggplot(top_15_america, aes(x = reorder(player.name, xGIper90), y = xGIper90)) +
+  geom_bar(stat = "identity", fill = "darkblue") +
+  coord_flip() +  
+  labs(title = "Jugadores con mayor xGI por 90 minutos - Copa América 2024",
+       x = "Jugador",
+       y = "xGI por 90 minutos") +
+  theme_minimal()
+bottom_15_america <- america_final %>%
+  arrange(xGIper90) %>%
+  head(15)
+ggplot(bottom_15_america, aes(x = reorder(player.name, xGIper90), y = xGIper90)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  coord_flip() +
+  labs(title = "Jugadores con menor xGI por 90 minutos - Copa América 2024",
+       x = "Jugador",
+       y = "xGI por 90 minutos") +
+  theme_minimal()
+
+#Lo repetimos para ambos torneos
+ambos_torneos <- bind_rows(america_final, euro_final)
+top_15 <- ambos_torneos %>%
+  arrange(desc(xGIper90)) %>%
+  head(15)
+ggplot(top_15, aes(x = reorder(player.name, xGIper90), y = xGIper90)) +
+  geom_bar(stat = "identity", fill = "darkblue") +
+  coord_flip() +  
+  labs(title = "Jugadores con mayor xGI por 90 minutos - Copa América y Euro 2024",
+       x = "Jugador",
+       y = "xGI por 90 minutos") +
+  theme_minimal()
+bottom_15 <- ambos_torneos %>%
+  arrange(xGIper90) %>%
+  head(15)
+ggplot(bottom_15, aes(x = reorder(player.name, xGIper90), y = xGIper90)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  coord_flip() +
+  labs(title = "Jugadores con menor xGI por 90 minutos - Copa América y Euro 2024",
+       x = "Jugador",
+       y = "xGI por 90 minutos") +
+  theme_minimal()
+```
+
+```{r}
+ligasTop <- c("Premier League", "LaLiga", "Serie A", "Ligue 1", "Bundesliga")
+euro_final <- euro_final %>%
+  mutate(Top.League = case_when(
+    League %in% ligasTop ~ TRUE,
+    TRUE ~ FALSE))
+america_final <- america_final %>%
+  mutate(Top.League = case_when(
+    League %in% ligasTop ~ TRUE,
+    TRUE ~ FALSE))
+ambos_torneos <- ambos_torneos %>%
+  mutate(Top.League = case_when(
+    League %in% ligasTop ~ TRUE,
+    TRUE ~ FALSE))
+promedios_euro <- euro_final %>%
+  group_by(Top.League) %>%
+  summarise(promedio_tot_xGI = mean(tot_xGI, na.rm = TRUE),
+            num_jugadores = n())
+promedios_america <- america_final %>%
+  group_by(Top.League) %>%
+  summarise(promedio_tot_xGI = mean(tot_xGI, na.rm = TRUE),
+            num_jugadores = n())
+promedios_total <- ambos_torneos %>%
+  group_by(Top.League)%>%
+  summarise(promedio_tot_xGI = mean(tot_xGI, na.rm = TRUE),
+            num_jugadores = n())
+print("Promedios de xGI por 90 minutos de jugadores de las mejores ligas de Europa contra las demás ligas.")
+print("True quiere decir que son jugadores de las mejores ligas.")
+print("Euro 2024.")
+print(promedios_euro)
+print("Copa América 2024.")
+print(promedios_america)
+print("Ambos torneos.")
+print(promedios_total)
+```
+# Conclusiones
+
+## Conclusiones del experimento
+
+La motivación del experimento puntual de comparar el desempeño de jugadores de las mejores ligas comparado con jugadores que no pertenecen a las mejores ligas. Un tema de conversación común en temas de selección nacional, por lo menos en México es si darle más minutos a los jugadores que juegan en Europa o a los jugadores que viven un buen momento en la liga local o ligas de menor nivel. Tanto en los resultados de la Copa América y la Euro del año 2024, es más alto el valor promedio de xGI por 90 minutos de los jugadores que juegan en las mejores ligas europeas. En la Euro hay más centrocampistas de las mejores ligas que jugadores en otras ligas. En la Copa América tenemos bastantes más jugadores de ligas menos populares que jugadores de ligas populares. Es por eso que también se analiza el desempeño en ambos torneos para balancear la cantidad de observaciones. 
+En general, ppodemos decir que los jugadores que juegan en las mejores ligas de europa aportan aproximadamente 0.25 goles esperados por partido. En general, basado en este análisis sería mejor convocar y darle minutos a jugadores de ligas con mejor nivel. Sin embargo, para la Copa América, creo que este resultado es menos conluyente, ya que la diferencia es de aproximadamente 0.004 xG por partido. Esto puede ser por el tipo de juego, arbitraje y competencia en Sudamérica es diferente al europeo. Puede ser una razón por la cual se ajustan mejor en la Euro que en la Copa América.
+
+## Conclusiones de xGI 
+
+En los resultados por jugador de los torneos analizados, podemos ver diferentes estilos de centrocampistas. Por ejemplo, en la gráfica de los jugadores con mejor xGI de la Euro 2024 encontramos jugadores como Shaqiri, Conceicao o Arda Guler que son centrocampistas ofensivos y sus pases y acciones generaron más probabilidad de gol. En la misma gráfica encontramos a jugadores como Scott McTominay, Soucek o Emre Can, centrocampistas con un enfoque completamente orientado a un apoyo defensivo. Esto es positivo para el análisis de esta métrica porque significa que no está beneficiando a jugadores ofensivos. 
+Como se mencionó al principio de este documento, muchas de las estadísticas que conocemos actualmente favorecen a los delanteros. Sobre todo hablando del xG, es una métrica enfocada a evaluar situaciones ofensivas como los tiros. Este ajuste que se realizó permite usar esta estadística ofensiva para evaluar a todo tipo de jugador.
+Aunque la métrica no esté evaluando cada una de las situaciones que suceden en un partido de futbol, es un buen primer acercamiento a encontrar una estadística global para evaluar a todos los jugadores de un partido. También nos sirve para evaluar jugadores dentro de un solo plantel. Por ejemplo, podemos analizar cuánta probabilidad de gol están aumentando los delanteros contra los centrocampistas para ver que zona del juego reforzar con transferencias en el próximo mercado.
+Creo que es una propuesta que se podría realizar para proveedores de datos o instituciones futbolísticas, en donde el cálculo de xGI sea más exacto y con mucha más información en la cuál confiar y obtener recursos. Por ejemplo, Statsbomb podría perfeccionar el cálculo de xGI y ayudarle a los equipos a obtener información valiosa del servicio que están contratando de Statsbomb. 
